@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Single-cell machine learning course utilities"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "scanpy",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scmlcourse"]
