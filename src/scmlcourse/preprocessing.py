@@ -248,8 +248,17 @@ def run_qc(input_file=INPUT_FILE, adata=None, plots_dir=None, out_path=None, scr
         adata = detect_doublets(adata)
     
     # log and normalize
-    sc.pp.log1p(adata)
-    sc.pp.normalize_total(adata, target_sum=1e6)
     if not out_path is None:
         adata.write(out_path)
+    return adata
+
+# Preprocessing by Nicolas
+
+def preprocess(adata, out_path=None):
+    sc.pp.normalize_total(adata, target_sum=1e6)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata)
+    sc.pp.pca(adata)
+    #sc.pp.neighbors(adata)
+    #sc.tl.umap(adata)
     return adata
