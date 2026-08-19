@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger
 
-
 class DataSet(Dataset):
     """Per-cell dataset yielding (expression, target log-fold-change signature) pairs.
 
@@ -28,7 +27,7 @@ class DataSet(Dataset):
         x = self.adata[name].X.toarray()
         counts = torch.as_tensor(x).squeeze(0).float()
         target = self.adata.obs.loc[name, "perturbed_gene"]
-        if pd.isna(target):
+        if pd.isna(target) or target.strip().lower() in ["ctrl", "control"]:
             y = torch.zeros(self.adata.n_vars)
         else:
             y = torch.as_tensor(np.array(self.fold_change_mtx[target]))
@@ -48,27 +47,30 @@ class DataModule(pl.LightningDataModule):
     remaining perturbations into stratified train/val sets.
     """
 
-    def __init__(self, adata_path:Path, n_pert=50, n_test_pert=10, val_size=0.1, batch_size=100, retain_adata=False):
+    def __init__(self, adata_path:Path, n_pert=50, n_test_pert=10, val_size=0.1, batch_size=100, retain_adata=False, control="control", n_top_genes=1000, n_workers=4):
         super().__init__()
+        self.n_workers = n_workers
         self.batch_size = batch_size
 
         self.adata = sc.read_h5ad(adata_path)
 
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbation"].map(lambda x: x.split("_")[0] if isinstance(x, str) else x)
         counts_per_perturbation = self.adata.obs["perturbed_gene"].value_counts()
-        target_genes = counts_per_perturbation.sort_values(ascending=False).index[:n_pert]
+        target_genes = counts_per_perturbation.sort_values(ascending=False).index[:n_pert+1] #assume control is in the most populated
 
         self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in target_genes or pd.isna(x))]
 
-        sc.pp.highly_variable_genes(self.adata,n_top_genes=1000)
+        sc.pp.normalize_total(self.adata, target_sum=1e6)
+        sc.pp.log1p(self.adata)
+        sc.pp.highly_variable_genes(self.adata,n_top_genes=n_top_genes)
         self.adata = self.adata[:,(self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in target_genes))]
 
         # select test set genes
-        test_genes = np.random.choice(target_genes, n_test_pert, replace=False)
+        test_genes = np.random.choice([x for x in target_genes if x != control], n_test_pert, replace=False)
         train_genes = target_genes[(test_genes[None, :] != target_genes.to_numpy()[:,None]).all(1)]
         
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbed_gene"].map(lambda x: "Ctrl" if pd.isna(x) else x)
-        sc.tl.rank_genes_groups(self.adata, "perturbed_gene", use_raw=False, reference="Ctrl")
+        sc.tl.rank_genes_groups(self.adata, "perturbed_gene", use_raw=False, reference=control)
 
         df = sc.get.rank_genes_groups_df(self.adata, group=None)
         logfoldchanges = (df.pivot(index="names", columns="group", values="logfoldchanges")
@@ -86,8 +88,8 @@ class DataModule(pl.LightningDataModule):
         train_obs, val_obs = train_test_split(train_adata.obs_names,test_size=val_size, stratify=perturbations)
 
         self.test_dataset = DataSet(adata = test_adata, fold_change_mtx=logfoldchanges[test_genes])
-        self.train_dataset = DataSet(adata=train_adata[train_obs], fold_change_mtx=logfoldchanges[train_genes])
-        self.val_dataset = DataSet(adata=train_adata[val_obs], fold_change_mtx=logfoldchanges[train_genes])
+        self.train_dataset = DataSet(adata=train_adata[train_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if x != control]])
+        self.val_dataset = DataSet(adata=train_adata[val_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if x != control]])
 
     def train_dataloader(self):
         """Return the DataLoader for the training split."""
@@ -95,20 +97,21 @@ class DataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
+            num_workers=self.n_workers
         )
     def val_dataloader(self):
         """Return the DataLoader for the validation split."""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            num_workers=self.n_workers,
         )
     def test_dataloader(self):
         """Return the DataLoader for the held-out test-perturbation split."""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            num_workers=self.n_workers
         )
 
 def train(
