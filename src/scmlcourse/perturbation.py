@@ -18,24 +18,39 @@ class DataSet(Dataset):
     """
 
     def __init__(self, adata, fold_change_mtx):
-        self.adata = adata
-        self.fold_change_mtx = fold_change_mtx
+
+        self.X = adata.X.toarray()
+        self.X = torch.as_tensor(self.X).float()
+        self.pert = adata.obs["perturbed_gene"].values
+        n_cells, n_genes = adata.n_obs, adata.n_vars
+
+        fc = fold_change_mtx.to_numpy()          # (n_genes, n_perturbations)
+        col_idx = {g: i for i, g in enumerate(fold_change_mtx.columns)}
+
+        y = np.zeros((n_cells, n_genes), dtype=np.float32)
+        for i, target in enumerate(self.pert):
+            if not (pd.isna(target) or ("ctrl" in str(target).strip().lower()) or  ("control" in str(target).strip().lower())):
+                y[i] = fc[:, col_idx[target]]
+
+        self.y = torch.as_tensor(y).float()
+        self.pert = (self.adata.var_names.values[None,:] == self.pert[:,None])
 
     def __getitem__(self, index):
         """Return (expression, target log-fold-change signature) for the cell at `index`."""
-        name = self.adata.obs_names[index]
-        x = self.adata[name].X.toarray()
-        counts = torch.as_tensor(x).squeeze(0).float()
-        target = self.adata.obs.loc[name, "perturbed_gene"]
-        if pd.isna(target) or target.strip().lower() in ["ctrl", "control"]:
-            y = torch.zeros(self.adata.n_vars)
-        else:
-            y = torch.as_tensor(np.array(self.fold_change_mtx[target]))
-        return counts, y
+        return self.X[index], self.y[index], self.pert[index]
+        #name = self.adata.obs_names[index]
+        #x = self.adata[name].X.toarray()
+        #counts = torch.as_tensor(x).squeeze(0).float()
+        #target = self.adata.obs.loc[name, "perturbed_gene"]
+        #if pd.isna(target) or target.strip().lower() in ["ctrl", "control"]:
+        #    y = torch.zeros(self.adata.n_vars)
+        #else:
+        #    y = torch.as_tensor(np.array(self.fold_change_mtx[target]))
+        #return counts, y
 
     def __len__(self):
         """Return the number of cells."""
-        return self.adata.n_obs
+        return len(self.X)
 
 class DataModule(pl.LightningDataModule):
     """Lightning DataModule for perturbation-effect prediction.
@@ -57,9 +72,16 @@ class DataModule(pl.LightningDataModule):
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbation"].map(lambda x: x.split("_")[0] if isinstance(x, str) else x)
         self.adata.obs["perturbed_gene"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+s), axis=1)
         counts_per_perturbation = self.adata.obs["perturbed_gene"].value_counts()
-        target_genes = counts_per_perturbation.sort_values(ascending=False).index[:n_pert+1] #assume control is in the most populated
-
-        self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in target_genes or pd.isna(x))]
+        ranking = counts_per_perturbation.sort_values(ascending=False).index
+        # filter out perturbed genes not in the variables
+        mask = ranking.map(lambda x: (x in self.adata.var_names) or (x==control))
+        _target_genes = ranking[mask][:n_pert] #assume control is in the most populated
+        target_genes = []
+        for t in _target_genes:
+            target_genes.extend([f"{t}_{c}" for c in np.unique(self.adata.obs["perturbation_2"])])
+        target_genes = np.array(target_genes)
+        self.adata.obs["perturbed_gene"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
+        self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in target_genes)]
 
         sc.pp.normalize_total(self.adata, target_sum=1e6)
         sc.pp.log1p(self.adata)
@@ -67,16 +89,22 @@ class DataModule(pl.LightningDataModule):
         self.adata = self.adata[:,(self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in target_genes))]
 
         # select test set genes
-        test_genes = np.random.choice([x for x in target_genes if x != control], n_test_pert, replace=False)
-        train_genes = target_genes[(test_genes[None, :] != target_genes.to_numpy()[:,None]).all(1)]
+        test_genes = np.random.choice([x for x in target_genes if x.split("_")[0] != control], n_test_pert, replace=False)
+        train_genes = target_genes[(test_genes[None, :] != target_genes[:,None]).all(1)]
         
-        self.adata.obs["perturbed_gene"] = self.adata.obs["perturbed_gene"].map(lambda x: "Ctrl" if pd.isna(x) else x)
-        sc.tl.rank_genes_groups(self.adata, "perturbed_gene", use_raw=False, reference=control)
 
-        df = sc.get.rank_genes_groups_df(self.adata, group=None)
-        logfoldchanges = (df.pivot(index="names", columns="group", values="logfoldchanges")
-                .reindex(self.adata.var_names))   # now rows == var order
-        
+        logfoldchanges = []
+        # calculate lofFC for each condition
+        for c in np.unique(self.adata.obs["perturbation_2"]):
+            subset = self.adata[self.adata.obs["perturbation_2"]==c].copy()
+            print(c,subset.obs["perturbed_gene"])
+            sc.tl.rank_genes_groups(subset, "perturbed_gene", use_raw=False, reference=f"{control}_{c}", method="wilcoxon")
+            df = sc.get.rank_genes_groups_df(subset, group=None)
+            print(df.head())
+            logfoldchanges.append(df.pivot(index="names", columns="group", values="logfoldchanges")
+                    .reindex(self.adata.var_names))   # now rows == var order
+        logfoldchanges = pd.concat(logfoldchanges, axis=1)
+        print(f"logfoldchanges has shape {logfoldchanges.shape}")
         print(test_genes, train_genes)
         train_adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in train_genes or pd.isna(x))]
         test_adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in test_genes)]
@@ -84,13 +112,12 @@ class DataModule(pl.LightningDataModule):
         if not retain_adata:
             del self.adata
         # split val train
-        perturbations = train_adata.obs["perturbed_gene"].to_numpy()
-        perturbations[pd.isna(perturbations)] = "Ctrl"
+        perturbations = train_adata.obs["perturbed_gene"].values
         train_obs, val_obs = train_test_split(train_adata.obs_names,test_size=val_size, stratify=perturbations)
 
         self.test_dataset = DataSet(adata = test_adata, fold_change_mtx=logfoldchanges[test_genes])
-        self.train_dataset = DataSet(adata=train_adata[train_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if x != control]])
-        self.val_dataset = DataSet(adata=train_adata[val_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if x != control]])
+        self.train_dataset = DataSet(adata=train_adata[train_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if control not in x]])
+        self.val_dataset = DataSet(adata=train_adata[val_obs], fold_change_mtx=logfoldchanges[[x for x in train_genes if control not in x]])
 
     def train_dataloader(self):
         """Return the DataLoader for the training split."""
@@ -120,8 +147,6 @@ def train(
     data_module,
     max_epochs: int = 100,
     patience: int = 15,
-    lr: float = 1e-3,
-    hidden_dims: tuple = (512, 512),
     log_dir: str = "logs",
     run_name: str = "pert_regressor",
     seed: int = 0,
@@ -148,7 +173,7 @@ def train(
             verbose=True,
         ),
         ModelCheckpoint(
-            dirpath=log_dir,
+            dirpath=loggers[0].log_dir,
             monitor="val_loss",
             mode="min",
             save_top_k=1,
@@ -186,7 +211,7 @@ class Baseline(pl.LightningModule):
 
     def _step(self, batch, batch_idx, stage:str):
         """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
-        x, log_fold_change = batch
+        x, log_fold_change, pert = batch
         y = self.module(x)
         loss = self.loss(log_fold_change, y)
         bs = x.size(0)
@@ -228,6 +253,50 @@ class Baseline(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"},
         }
 
+class cVAE(Baseline):
+    '''Conditional Autoencoder'''
+    def __init__(in_dim, latent_dim, encoder_kwargs:dict, decoder_kwargs:dict, lr=1e-5, regularization:float=1.0):
+        super().__init__(loss=nn.MSELoss, lr=lr)
+        self.regularization = regularization
+        self.in_dim = in_dim
+        self.latent_dim = latent_dim
+        encoder_kwargs["in_dim"] = in_dim
+        decoder_kwargs["out_dim"] = in_dim
+        # decoder input is encoder output + one_hot of perturbation
+        encoder_kwargs["out_dim"] = latent_dim+in_dim
+        decoder_kwargs["in_dim"] = latent_dim+in_dim
+        self.mu_encoder = MLP(*encoder_kwargs)
+        self.sigma_encoder = MLP(*encoder_kwargs)
+        self.decoder = MLP(*decoder_kwargs)
+
+        # reparametrization
+        self.N = torch.distributions.Normal(0, 1)
+        self.N.loc = self.N.loc.cuda()
+        self.N.scale = self.N.scale.cuda()
+
+
+    def _step(self, batch, batch_idx, stage:str):
+        """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
+        x, log_fold_change, pert = batch
+        mu = self.mu_encoder(x)
+        sigma = self.sigma_encoder(x)
+        latent = mu + torch.exp(sigma)*self.N.sample(mu.shape)
+        x_hat = self.decoder(torch.concat([latent, pert]))
+
+        kl = -0.5*torch.sum(-mu**2-sigma**2+torch.log(sigma**2)+1)
+        mse = self.loss(x, x_hat)
+        loss = mse+kl*self.regularization
+
+        bs = x.size(0)
+        self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs,
+                 on_step=(stage == "train"), on_epoch=True)
+        self.log(f"{stage}_loss_kl", kl, prog_bar=True, batch_size=bs,
+                 on_step=(stage == "train"), on_epoch=True)
+        self.log(f"{stage}_loss_mse", mse, prog_bar=True, batch_size=bs,
+                 on_step=(stage == "train"), on_epoch=True)
+        self.log(f"{stage}_pearson", self._pearson(y, log_fold_change), prog_bar=(stage != "train"),
+                 batch_size=bs, on_step=False, on_epoch=True)
+        return loss
 
 class MLP(nn.Module):
     """Feed-forward network of Linear-activation-Dropout blocks with a final Linear output layer."""
