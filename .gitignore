@@ -220,3 +220,4 @@ __marimo__/
 notebooks/*logs/
 
 notebooks/sandbox.ipynb
+**/logs/**
