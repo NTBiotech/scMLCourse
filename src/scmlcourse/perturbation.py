@@ -70,7 +70,6 @@ class DataModule(pl.LightningDataModule):
         self.adata = sc.read_h5ad(adata_path)
 
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbation"].map(lambda x: x.split("_")[0] if isinstance(x, str) else x)
-        self.adata.obs["perturbed_gene"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+s), axis=1)
         counts_per_perturbation = self.adata.obs["perturbed_gene"].value_counts()
         ranking = counts_per_perturbation.sort_values(ascending=False).index
         # filter out perturbed genes not in the variables
