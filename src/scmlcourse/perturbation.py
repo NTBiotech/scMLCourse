@@ -21,7 +21,7 @@ class DataSet(Dataset):
 
         self.X = adata.X.toarray()
         self.X = torch.as_tensor(self.X).float()
-        self.pert = adata.obs["perturbed_gene"].values
+        self.pert = adata.obs["perturbed_condition"].to_numpy()
         n_cells, n_genes = adata.n_obs, adata.n_vars
 
         fc = fold_change_mtx.to_numpy()          # (n_genes, n_perturbations)
@@ -33,7 +33,8 @@ class DataSet(Dataset):
                 y[i] = fc[:, col_idx[target]]
 
         self.y = torch.as_tensor(y).float()
-        self.pert = (self.adata.var_names.values[None,:] == self.pert[:,None])
+        # one hot encode perturbations
+        self.pert = (adata.var_names.to_numpy()[None,:] == adata.obs["perturbed_gene"].to_numpy()[:,None])
 
     def __getitem__(self, index):
         """Return (expression, target log-fold-change signature) for the cell at `index`."""
@@ -79,13 +80,17 @@ class DataModule(pl.LightningDataModule):
         for t in _target_genes:
             target_genes.extend([f"{t}_{c}" for c in np.unique(self.adata.obs["perturbation_2"])])
         target_genes = np.array(target_genes)
-        self.adata.obs["perturbed_gene"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
-        self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in target_genes)]
+        self.adata.obs["perturbed_condition"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
+        print(self.adata)
+        self.adata = self.adata[self.adata.obs["perturbed_condition"].map(lambda x: x in target_genes)]
+        print(self.adata)
 
         sc.pp.normalize_total(self.adata, target_sum=1e6)
         sc.pp.log1p(self.adata)
         sc.pp.highly_variable_genes(self.adata,n_top_genes=n_top_genes)
-        self.adata = self.adata[:,(self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in target_genes))]
+
+        self.adata = self.adata[:,(self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in _target_genes))]
+        print(self.adata)
 
         # select test set genes
         test_genes = np.random.choice([x for x in target_genes if x.split("_")[0] != control], n_test_pert, replace=False)
@@ -96,8 +101,8 @@ class DataModule(pl.LightningDataModule):
         # calculate lofFC for each condition
         for c in np.unique(self.adata.obs["perturbation_2"]):
             subset = self.adata[self.adata.obs["perturbation_2"]==c].copy()
-            print(c,subset.obs["perturbed_gene"])
-            sc.tl.rank_genes_groups(subset, "perturbed_gene", use_raw=False, reference=f"{control}_{c}", method="wilcoxon")
+            print(c,subset.obs["perturbed_condition"])
+            sc.tl.rank_genes_groups(subset, "perturbed_condition", use_raw=False, reference=f"{control}_{c}", method="wilcoxon")
             df = sc.get.rank_genes_groups_df(subset, group=None)
             print(df.head())
             logfoldchanges.append(df.pivot(index="names", columns="group", values="logfoldchanges")
@@ -105,13 +110,15 @@ class DataModule(pl.LightningDataModule):
         logfoldchanges = pd.concat(logfoldchanges, axis=1)
         print(f"logfoldchanges has shape {logfoldchanges.shape}")
         print(test_genes, train_genes)
-        train_adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in train_genes or pd.isna(x))]
-        test_adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in test_genes)]
+        train_adata = self.adata[self.adata.obs["perturbed_condition"].map(lambda x: x in train_genes or pd.isna(x))]
+        test_adata = self.adata[self.adata.obs["perturbed_condition"].map(lambda x: x in test_genes)]
         self.n_vars = self.adata.n_vars
+        self.test_genes = test_genes
+        self.train_genes = train_genes
         if not retain_adata:
             del self.adata
         # split val train
-        perturbations = train_adata.obs["perturbed_gene"].values
+        perturbations = train_adata.obs["perturbed_condition"].values
         train_obs, val_obs = train_test_split(train_adata.obs_names,test_size=val_size, stratify=perturbations)
 
         self.test_dataset = DataSet(adata = test_adata, fold_change_mtx=logfoldchanges[test_genes])
@@ -181,7 +188,7 @@ def train(
         ),
         LearningRateMonitor(logging_interval="epoch"),
     ]
- 
+    print(f"Training for max {max_epochs} epochs...")
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -196,7 +203,8 @@ def train(
  
     trainer.fit(model, datamodule=data_module)
     test_scores = trainer.test(model, datamodule=data_module, ckpt_path="best")
-    return model, test_scores
+
+    return model, test_scores, loggers[0].log_dir
 
 
 class Baseline(pl.LightningModule):
@@ -222,15 +230,15 @@ class Baseline(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Run one training step."""
-        self._step(batch, batch_idx, "train")
+        return self._step(batch, batch_idx, "train")
 
     def validation_step(self, batch, batch_idx):
         """Run one validation step."""
-        self._step(batch, batch_idx, "val")
+        return self._step(batch, batch_idx, "val")
 
     def test_step(self, batch, batch_idx):
         """Run one test step."""
-        self._step(batch, batch_idx, "test")
+        return self._step(batch, batch_idx, "test")
 
     @staticmethod
     def _pearson(pred, target):
@@ -252,50 +260,87 @@ class Baseline(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"},
         }
 
-class cVAE(Baseline):
+class cVAE(Baseline, pl.LightningModule):
     '''Conditional Autoencoder'''
-    def __init__(in_dim, latent_dim, encoder_kwargs:dict, decoder_kwargs:dict, lr=1e-5, regularization:float=1.0):
-        super().__init__(loss=nn.MSELoss, lr=lr)
-        self.regularization = regularization
+    def __init__(self, in_dim, latent_dim, encoder_kwargs:dict, decoder_kwargs:dict, lr=1e-5, pretrain_epochs=0, kl_midpoint=20, kl_slope=1):
         self.in_dim = in_dim
         self.latent_dim = latent_dim
         encoder_kwargs["in_dim"] = in_dim
         decoder_kwargs["out_dim"] = in_dim
         # decoder input is encoder output + one_hot of perturbation
-        encoder_kwargs["out_dim"] = latent_dim+in_dim
+        encoder_kwargs["out_dim"] = latent_dim
         decoder_kwargs["in_dim"] = latent_dim+in_dim
-        self.mu_encoder = MLP(*encoder_kwargs)
-        self.sigma_encoder = MLP(*encoder_kwargs)
-        self.decoder = MLP(*decoder_kwargs)
+        super().__init__(decoder_kwargs)
+        
+        print(encoder_kwargs)
+        self.mu_encoder = MLP(**encoder_kwargs)
+        print(encoder_kwargs)
+        self.sigma_encoder = MLP(**encoder_kwargs)
+        print(decoder_kwargs)
+        self.decoder = self.module
 
-        # reparametrization
-        self.N = torch.distributions.Normal(0, 1)
-        self.N.loc = self.N.loc.cuda()
-        self.N.scale = self.N.scale.cuda()
+        self.kl_midpoint = kl_midpoint
+        self.kl_slope = kl_slope
+        self.kl = 0.00001
 
+        self.pretrain_epochs=pretrain_epochs
+        self.pretrain = self.pretrain_epochs>0
 
     def _step(self, batch, batch_idx, stage:str):
         """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
-        x, log_fold_change, pert = batch
+        x, gt_fc, pert = batch
         mu = self.mu_encoder(x)
-        sigma = self.sigma_encoder(x)
-        latent = mu + torch.exp(sigma)*self.N.sample(mu.shape)
-        x_hat = self.decoder(torch.concat([latent, pert]))
+        logvar = self.sigma_encoder(x)
+        std = torch.exp(0.5 * logvar)
+        latent = mu + std * torch.randn_like(mu)
+        x_hat = self.decoder(torch.concat([latent, pert], axis=1))
 
-        kl = -0.5*torch.sum(-mu**2-sigma**2+torch.log(sigma**2)+1)
-        mse = self.loss(x, x_hat)
-        loss = mse+kl*self.regularization
-
+        kl = (-0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1)).mean()
+        mse_x = self.loss(x, x_hat)
+        loss = mse_x+kl*self.kl
+        
         bs = x.size(0)
+        
         self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs,
-                 on_step=(stage == "train"), on_epoch=True)
+                on_step=(stage == "train"), on_epoch=True)
         self.log(f"{stage}_loss_kl", kl, prog_bar=True, batch_size=bs,
-                 on_step=(stage == "train"), on_epoch=True)
-        self.log(f"{stage}_loss_mse", mse, prog_bar=True, batch_size=bs,
-                 on_step=(stage == "train"), on_epoch=True)
-        self.log(f"{stage}_pearson", self._pearson(y, log_fold_change), prog_bar=(stage != "train"),
-                 batch_size=bs, on_step=False, on_epoch=True)
+                on_step=(stage == "train"), on_epoch=True)
+        self.log(f"{stage}_loss_mse_x", mse_x, prog_bar=True, batch_size=bs,
+                on_step=(stage == "train"), on_epoch=True)
         return loss
+
+    def test_step(self, batch, batch_idx):
+        """Run one test step."""
+        bs = batch[0].size(0)
+        fc, loss, pearson = self.predict_fc(batch, batch_idx)
+        self.log(f"test_loss", loss, prog_bar=True, batch_size=bs, on_epoch=True)
+        self.log(f"pearson", pearson, prog_bar=True, batch_size=bs, on_epoch=True)
+        return loss
+    
+    def on_train_epoch_start(self):
+        self.kl = self.kl_schedule(self.current_epoch)
+        if self.current_epoch > self.pretrain_epochs:
+            self.pretrain=False
+
+    def kl_schedule(self, time_step, ):
+        return float(1 / (1. + np.exp(self.kl_slope * (self.kl_midpoint - float(time_step)))))
+    
+    def predict_fc(self, batch, batch_idx):
+        stage = "fc_prediction"
+        x, gt_fc, pert = batch
+        mu = self.mu_encoder(x)
+        logvar = self.sigma_encoder(x)
+        std = torch.exp(0.5 * logvar)
+        latent = mu + std * torch.randn_like(mu)
+        x_hat = self.decoder(torch.concat([latent, pert], axis=1))
+        x_ctrl_hat = self.decoder(torch.concat([torch.zeros_like(latent), pert], axis=1))
+        fc = self.log2foldchange(x_ctrl_hat, x_hat)
+        loss = self.loss(fc, gt_fc)
+        pearson = self._pearson(fc, gt_fc)
+        return fc, loss, pearson
+
+    def log2foldchange(self, y, ctrl) -> torch.Tensor:
+        return torch.log2(y/ctrl)
 
 class MLP(nn.Module):
     """Feed-forward network of Linear-activation-Dropout blocks with a final Linear output layer."""
@@ -315,4 +360,3 @@ class MLP(nn.Module):
     def forward(self, x):
         """Apply the network to input `x`."""
         return self.net(x)
- 
