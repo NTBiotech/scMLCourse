@@ -19,8 +19,7 @@ class DataSet(Dataset):
 
     def __init__(self, adata, fold_change_mtx):
 
-        self.X = adata.X.toarray()
-        self.X = torch.as_tensor(self.X).float()
+        self.X = torch.as_tensor(adata.layers["raw"].toarray()).float()
         self.pert = adata.obs["perturbed_condition"].to_numpy()
         n_cells, n_genes = adata.n_obs, adata.n_vars
 
@@ -69,40 +68,41 @@ class DataModule(pl.LightningDataModule):
         self.batch_size = batch_size
 
         self.adata = sc.read_h5ad(adata_path)
-
+        self.conditions = np.unique(self.adata.obs["perturbation_2"])
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbation"].map(lambda x: x.split("_")[0] if isinstance(x, str) else x)
+        self.adata.obs["perturbed_condition"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
+        
         counts_per_perturbation = self.adata.obs["perturbed_gene"].value_counts()
         ranking = counts_per_perturbation.sort_values(ascending=False).index
         # filter out perturbed genes not in the variables
         mask = ranking.map(lambda x: (x in self.adata.var_names) or (x==control))
-        _target_genes = ranking[mask][:n_pert] #assume control is in the most populated
-        target_genes = []
-        for t in _target_genes:
-            target_genes.extend([f"{t}_{c}" for c in np.unique(self.adata.obs["perturbation_2"])])
-        target_genes = np.array(target_genes)
-        self.adata.obs["perturbed_condition"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
-        print(self.adata)
-        self.adata = self.adata[self.adata.obs["perturbed_condition"].map(lambda x: x in target_genes)]
-        print(self.adata)
+        _target_genes = ranking[mask][:n_pert+1] #assume control is in the most populated
+        
+        self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in _target_genes)]
+        self.adata.layers["raw"] = self.adata.X.copy()
 
         sc.pp.normalize_total(self.adata, target_sum=1e6)
         sc.pp.log1p(self.adata)
         sc.pp.highly_variable_genes(self.adata,n_top_genes=n_top_genes)
 
-        self.adata = self.adata[:,(self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in _target_genes))]
-        print(self.adata)
+        mask = (self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in _target_genes))
+        self.adata = self.adata[:,mask]
 
         # select test set genes
-        test_genes = np.random.choice([x for x in target_genes if x.split("_")[0] != control], n_test_pert, replace=False)
-        train_genes = target_genes[(test_genes[None, :] != target_genes[:,None]).all(1)]
-        
-
+        self._test_genes = np.random.choice([x for x in _target_genes if x.split("_")[0] != control], n_test_pert, replace=False)
+        self._train_genes = _target_genes[(self._test_genes[None, :] != _target_genes.to_numpy()[:,None]).all(1)]
+        test_genes = []
+        for g in self._test_genes:
+            test_genes.extend([f"{g}_{c}" for c in self.conditions])
+        train_genes = []
+        for g in self._train_genes:
+            train_genes.extend([f"{g}_{c}" for c in self.conditions])
         logfoldchanges = []
         # calculate lofFC for each condition
-        for c in np.unique(self.adata.obs["perturbation_2"]):
+        for c in self.conditions:
             subset = self.adata[self.adata.obs["perturbation_2"]==c].copy()
             print(c,subset.obs["perturbed_condition"])
-            sc.tl.rank_genes_groups(subset, "perturbed_condition", use_raw=False, reference=f"{control}_{c}", method="wilcoxon")
+            sc.tl.rank_genes_groups(subset, "perturbed_condition", reference=f"{control}_{c}", method="wilcoxon", use_raw=False)
             df = sc.get.rank_genes_groups_df(subset, group=None)
             print(df.head())
             logfoldchanges.append(df.pivot(index="names", columns="group", values="logfoldchanges")
@@ -131,7 +131,8 @@ class DataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.n_workers
+            num_workers=self.n_workers,
+            persistent_workers=True,
         )
     def val_dataloader(self):
         """Return the DataLoader for the validation split."""
@@ -139,13 +140,15 @@ class DataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.n_workers,
+            persistent_workers=True,
         )
     def test_dataloader(self):
         """Return the DataLoader for the held-out test-perturbation split."""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            num_workers=self.n_workers
+            num_workers=self.n_workers,
+            persistent_workers=True,
         )
 
 def train(
@@ -270,7 +273,9 @@ class cVAE(Baseline, pl.LightningModule):
         # decoder input is encoder output + one_hot of perturbation
         encoder_kwargs["out_dim"] = latent_dim
         decoder_kwargs["in_dim"] = latent_dim+in_dim
-        super().__init__(decoder_kwargs)
+        decoder_kwargs["out_activation"] = nn.ReLU
+        encoder_kwargs["out_activation"] = None
+        super().__init__(decoder_kwargs, lr=lr)
         
         print(encoder_kwargs)
         self.mu_encoder = MLP(**encoder_kwargs)
@@ -291,6 +296,7 @@ class cVAE(Baseline, pl.LightningModule):
         x, gt_fc, pert = batch
         mu = self.mu_encoder(x)
         logvar = self.sigma_encoder(x)
+        logvar = torch.clamp(logvar, min=-10, max=10)
         std = torch.exp(0.5 * logvar)
         latent = mu + std * torch.randn_like(mu)
         x_hat = self.decoder(torch.concat([latent, pert], axis=1))
@@ -298,9 +304,25 @@ class cVAE(Baseline, pl.LightningModule):
         kl = (-0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1)).mean()
         mse_x = self.loss(x, x_hat)
         loss = mse_x+kl*self.kl
+        pearson = self._pearson(x, x_hat)
         
         bs = x.size(0)
+        if stage=="train":
+            self.log(f"{stage}_mu_min", mu.min(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_mu_max", mu.max(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_mu_mean", mu.mean(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_logvar_min", logvar.min(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_logvar_max", logvar.max(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_logvar_mean", logvar.mean(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_latent_min", latent.min(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_latent_max", latent.max(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_latent_mean", latent.mean(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_x_hat_min", x_hat.min(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_x_hat_max", x_hat.max(), batch_size=bs,on_step=False, on_epoch=True)
+            self.log(f"{stage}_x_hat_mean", x_hat.mean(), batch_size=bs,on_step=False, on_epoch=True)
         
+        self.log(f"{stage}_pearson", pearson, prog_bar=True, batch_size=bs,
+                on_step=False, on_epoch=True)
         self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs,
                 on_step=(stage == "train"), on_epoch=True)
         self.log(f"{stage}_loss_kl", kl, prog_bar=True, batch_size=bs,
@@ -312,19 +334,20 @@ class cVAE(Baseline, pl.LightningModule):
     def test_step(self, batch, batch_idx):
         """Run one test step."""
         bs = batch[0].size(0)
-        fc, loss, pearson = self.predict_fc(batch, batch_idx)
+        fc, loss, pearson_fc, pearson_x = self.predict_fc(batch, batch_idx)
         self.log(f"test_loss", loss, prog_bar=True, batch_size=bs, on_epoch=True)
-        self.log(f"pearson", pearson, prog_bar=True, batch_size=bs, on_epoch=True)
+        self.log(f"pearson_fc", pearson_fc, prog_bar=True, batch_size=bs, on_epoch=True)
+        self.log(f"pearson_x", pearson_x, prog_bar=True, batch_size=bs, on_epoch=True)
         return loss
     
     def on_train_epoch_start(self):
         self.kl = self.kl_schedule(self.current_epoch)
-        if self.current_epoch > self.pretrain_epochs:
-            self.pretrain=False
+        self.log("kl_factor", self.kl, prog_bar=True)
+        self.log("lr", self.lr, prog_bar=True)
 
     def kl_schedule(self, time_step, ):
         return float(1 / (1. + np.exp(self.kl_slope * (self.kl_midpoint - float(time_step)))))
-    
+
     def predict_fc(self, batch, batch_idx):
         stage = "fc_prediction"
         x, gt_fc, pert = batch
@@ -333,13 +356,16 @@ class cVAE(Baseline, pl.LightningModule):
         std = torch.exp(0.5 * logvar)
         latent = mu + std * torch.randn_like(mu)
         x_hat = self.decoder(torch.concat([latent, pert], axis=1))
-        x_ctrl_hat = self.decoder(torch.concat([torch.zeros_like(latent), pert], axis=1))
-        fc = self.log2foldchange(x_ctrl_hat, x_hat)
+        x_ctrl_hat = self.decoder(torch.concat([latent, torch.zeros_like(pert)], axis=1))
+        fc = self.log2foldchange(x_hat, x_ctrl_hat)
         loss = self.loss(fc, gt_fc)
-        pearson = self._pearson(fc, gt_fc)
-        return fc, loss, pearson
+        pearson_fc = self._pearson(fc, gt_fc)
+        pearson_x = self._pearson(x_hat, x)
+        return fc, loss, pearson_fc, pearson_x
 
-    def log2foldchange(self, y, ctrl) -> torch.Tensor:
+    def log2foldchange(self, y, ctrl, eps=1e-6) -> torch.Tensor:
+        y = torch.clamp(y, min=eps)
+        ctrl = torch.clamp(ctrl, min=eps)
         return torch.log2(y/ctrl)
 
 class MLP(nn.Module):
