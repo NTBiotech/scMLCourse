@@ -75,6 +75,7 @@ INPUT_FILE = '/home/ubuntu/data/frangieh/rna.h5ad'
 
 
 def load_qc_adata(input_file=INPUT_FILE):
+    """Load the raw AnnData used for QC and print its cell/gene counts."""
     adata = ad.read_h5ad(input_file)
     print('Number of Cells:', adata.n_obs)
     print('Number of Genes:', adata.n_vars)
@@ -82,6 +83,12 @@ def load_qc_adata(input_file=INPUT_FILE):
 
 
 def calculate_qc_metrics(adata):
+    """Flag mitochondrial/ribosomal/hemoglobin genes and compute per-cell QC metrics.
+
+    Adds boolean `mt`/`ribo`/`hb` columns to `adata.var`, then runs
+    `sc.pp.calculate_qc_metrics` (in place) to populate the corresponding
+    `pct_counts_*`/`total_counts`/`n_genes_by_counts` columns in `adata.obs`.
+    """
     # mitochondrial genes, "MT-" for human, "Mt-" for mouse
     adata.var["mt"] = adata.var_names.str.startswith("MT-")
     # ribosomal genes
@@ -94,7 +101,10 @@ def calculate_qc_metrics(adata):
 
 ## Outlier filtering
 def outlier_func(adata_object, metric: str, nmads: int, print_tresholds=False):
+    """Flag cells whose `metric` is more than `nmads` MADs from the median.
 
+    Returns a boolean Series over `adata_object.obs`, True for outlier cells.
+    """
     metric_median = np.median(adata_object.obs[metric])
     metric_mad = np.median(np.absolute(adata_object.obs[metric] - metric_median))
     upper_T = metric_median + (nmads*metric_mad)
@@ -108,12 +118,18 @@ def outlier_func(adata_object, metric: str, nmads: int, print_tresholds=False):
 
 
 def _save_fig(fig, plots_dir, label, name):
+    """Save `fig` to `plots_dir/{label}_{name}.png`, creating `plots_dir` if needed."""
     plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(plots_dir / f"{label}_{name}.png", bbox_inches="tight")
 
 
 def qc_plots(adata, plots_dir=None, label="qc"):
+    """Plot violin plots of counts, genes, and pct-count QC metrics.
+
+    Shown interactively if `plots_dir` is None, otherwise saved there as
+    `{label}_counts.png`, `{label}_genes.png`, and `{label}_pct_counts.png`.
+    """
     ax = sc.pl.violin(
     adata,
     ["total_counts", "log1p_total_counts"],
@@ -144,6 +160,11 @@ def qc_plots(adata, plots_dir=None, label="qc"):
 
 
 def qc_scatter(adata, plots_dir=None, label="qc"):
+    """Scatter total_counts vs. n_genes_by_counts, colored by pct_counts_mt.
+
+    Shown interactively if `plots_dir` is None, otherwise saved there as
+    `{label}_scatter.png`.
+    """
     ax = sc.pl.scatter(
         adata,
         "total_counts",
@@ -165,6 +186,7 @@ def qc_scatter(adata, plots_dir=None, label="qc"):
 
 ### Min Cells and Genes filters
 def filter_min_genes_cells(adata, min_genes=200, min_cells=20):
+    """Drop cells with fewer than `min_genes` genes and genes seen in fewer than `min_cells` cells."""
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
     return adata
@@ -172,6 +194,13 @@ def filter_min_genes_cells(adata, min_genes=200, min_cells=20):
 
 ### QC Metrics
 def flag_qc_outliers(adata, verbose=False):
+    """Flag cells that are MAD-based outliers on any of several QC metrics.
+
+    Combines `outlier_func` calls (6 MADs, except 5 for
+    `pct_counts_in_top_50_genes`) across total_counts, log1p_total_counts,
+    n_genes_by_counts, log1p_n_genes_by_counts, pct_counts_mt, and
+    pct_counts_in_top_50_genes into a single boolean Series.
+    """
     if verbose:
         print(outlier_func(adata, 'total_counts', 7).value_counts())
         print(outlier_func(adata, 'n_genes_by_counts', 4).value_counts())
@@ -186,6 +215,7 @@ def flag_qc_outliers(adata, verbose=False):
 
 
 def filter_qc_outliers(adata):
+    """Flag (via `flag_qc_outliers`) and drop QC-outlier cells, returning a copy."""
     adata.obs['outlier'] = flag_qc_outliers(adata)
     print(adata.obs['outlier'].value_counts())
     adata = adata[~adata.obs['outlier'], :].copy()
@@ -194,6 +224,7 @@ def filter_qc_outliers(adata):
 
 ## Doublet Detection
 def detect_doublets(adata, batch_key="perturbation_2"):
+    """Run scanpy's scrublet doublet detection, batched by `batch_key`."""
     print(adata.obs.columns)
     #print(adata.obs['tissue_type'].value_counts())
     print(adata.obs[batch_key].value_counts())
@@ -255,6 +286,11 @@ def run_qc(input_file=INPUT_FILE, adata=None, plots_dir=None, out_path=None, scr
 # Preprocessing by Nicolas
 
 def preprocess(adata, out_path=None):
+    """Normalize, log-transform, and PCA-embed `adata`; optionally write it out.
+
+    Neighbors/UMAP are left commented out here since downstream notebooks
+    compute them with task-specific parameters.
+    """
     sc.pp.normalize_total(adata, target_sum=1e6)
     sc.pp.log1p(adata)
     sc.pp.highly_variable_genes(adata)

@@ -18,7 +18,7 @@ class DataSet(Dataset):
     """
 
     def __init__(self, adata, fold_change_mtx):
-
+        # raw (pre-normalization) counts are the model input
         self.X = torch.as_tensor(adata.layers["raw"].toarray()).float()
         self.pert = adata.obs["perturbed_condition"].to_numpy()
         n_cells, n_genes = adata.n_obs, adata.n_vars
@@ -26,6 +26,8 @@ class DataSet(Dataset):
         fc = fold_change_mtx.to_numpy()          # (n_genes, n_perturbations)
         col_idx = {g: i for i, g in enumerate(fold_change_mtx.columns)}
 
+        # target: the perturbed condition's logFC signature, or all-zero for
+        # control cells (no matching column in fold_change_mtx)
         y = np.zeros((n_cells, n_genes), dtype=np.float32)
         for i, target in enumerate(self.pert):
             if not (pd.isna(target) or ("ctrl" in str(target).strip().lower()) or  ("control" in str(target).strip().lower())):
@@ -36,7 +38,7 @@ class DataSet(Dataset):
         self.pert = (adata.var_names.to_numpy()[None,:] == adata.obs["perturbed_gene"].to_numpy()[:,None])
 
     def __getitem__(self, index):
-        """Return (expression, target log-fold-change signature) for the cell at `index`."""
+        """Return (raw expression, target logFC signature, one-hot perturbed gene) for the cell at `index`."""
         return self.X[index], self.y[index], self.pert[index]
         #name = self.adata.obs_names[index]
         #x = self.adata[name].X.toarray()
@@ -69,15 +71,18 @@ class DataModule(pl.LightningDataModule):
 
         self.adata = sc.read_h5ad(adata_path)
         self.conditions = np.unique(self.adata.obs["perturbation_2"])
+        # "perturbed_gene": the target gene only; "perturbed_condition": gene+experimental
+        # condition, since a gene's effect can differ across conditions (e.g. co-culture vs. mono-culture)
         self.adata.obs["perturbed_gene"] = self.adata.obs["perturbation"].map(lambda x: x.split("_")[0] if isinstance(x, str) else x)
         self.adata.obs["perturbed_condition"] = self.adata.obs[["perturbed_gene","perturbation_2"]].apply(lambda x: str(x["perturbed_gene"]+"_"+str(x["perturbation_2"])), axis=1)
-        
+
         counts_per_perturbation = self.adata.obs["perturbed_gene"].value_counts()
         ranking = counts_per_perturbation.sort_values(ascending=False).index
         # filter out perturbed genes not in the variables
         mask = ranking.map(lambda x: (x in self.adata.var_names) or (x==control))
         _target_genes = ranking[mask][:n_pert+1] #assume control is in the most populated
-        
+
+        # restrict to cells with one of the top n_pert perturbed genes (+ control)
         self.adata = self.adata[self.adata.obs["perturbed_gene"].map(lambda x: x in _target_genes)]
         self.adata.layers["raw"] = self.adata.X.copy()
 
@@ -85,12 +90,15 @@ class DataModule(pl.LightningDataModule):
         sc.pp.log1p(self.adata)
         sc.pp.highly_variable_genes(self.adata,n_top_genes=n_top_genes)
 
+        # keep highly variable genes plus the target genes themselves (so
+        # every perturbed gene appears in the model's input/output space)
         mask = (self.adata.var["highly_variable"] | self.adata.var_names.map(lambda x: x in _target_genes))
         self.adata = self.adata[:,mask]
 
-        # select test set genes
+        # hold out n_test_pert perturbed genes entirely (never seen in training)
         self._test_genes = np.random.choice([x for x in _target_genes if x.split("_")[0] != control], n_test_pert, replace=False)
         self._train_genes = _target_genes[(self._test_genes[None, :] != _target_genes.to_numpy()[:,None]).all(1)]
+        # expand each gene into one perturbed_condition entry per experimental condition
         test_genes = []
         for g in self._test_genes:
             test_genes.extend([f"{g}_{c}" for c in self.conditions])
@@ -98,7 +106,9 @@ class DataModule(pl.LightningDataModule):
         for g in self._train_genes:
             train_genes.extend([f"{g}_{c}" for c in self.conditions])
         logfoldchanges = []
-        # calculate lofFC for each condition
+        # compute each perturbed_condition's logFC signature vs. its matching
+        # control, separately per experimental condition (since the control
+        # baseline differs between conditions)
         for c in self.conditions:
             subset = self.adata[self.adata.obs["perturbation_2"]==c].copy()
             print(c,subset.obs["perturbed_condition"])
@@ -117,7 +127,8 @@ class DataModule(pl.LightningDataModule):
         self.train_genes = train_genes
         if not retain_adata:
             del self.adata
-        # split val train
+        # split val train, stratified so each perturbed_condition is
+        # represented proportionally in both splits
         perturbations = train_adata.obs["perturbed_condition"].values
         train_obs, val_obs = train_test_split(train_adata.obs_names,test_size=val_size, stratify=perturbations)
 
@@ -297,7 +308,14 @@ class pertMLP(Baseline):
 
 
 class cVAE(Baseline, pl.LightningModule):
-    '''Conditional Autoencoder'''
+    '''Conditional VAE that reconstructs expression conditioned on the perturbed gene.
+
+    Encodes raw expression `x` to a latent Gaussian, decodes
+    `[latent, perturbation_one_hot]` back to expression, and derives the
+    predicted logFC signature at test time as `log2(decoded / decoded_ctrl)`
+    (see `predict_fc`), where `decoded_ctrl` decodes the same latent with an
+    all-zero (control) perturbation vector.
+    '''
     def __init__(self, in_dim, latent_dim, encoder_kwargs:dict, decoder_kwargs:dict, lr=1e-5, pretrain_epochs=0, kl_midpoint=20, kl_slope=1):
         self.in_dim = in_dim
         self.latent_dim = latent_dim
@@ -325,7 +343,12 @@ class cVAE(Baseline, pl.LightningModule):
         self.pretrain = self.pretrain_epochs>0
 
     def _step(self, batch, batch_idx, stage:str):
-        """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
+        """Encode/reparameterize/decode a batch and log the reconstruction + KL loss.
+
+        Loss is `mse(x, x_hat) + kl * self.kl` (`self.kl` is annealed by
+        `kl_schedule`/`on_train_epoch_start`). Also logs the encoder/decoder
+        statistics (min/max/mean of mu, logvar, latent, x_hat) during training.
+        """
         x, gt_fc, pert = batch
         mu = self.mu_encoder(x)
         logvar = self.sigma_encoder(x)
@@ -365,23 +388,32 @@ class cVAE(Baseline, pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        """Run one test step."""
+        """Run one test step, evaluating the predicted logFC signature via `predict_fc`."""
         bs = batch[0].size(0)
         fc, loss, pearson_fc, pearson_x = self.predict_fc(batch, batch_idx)
         self.log(f"test_loss", loss, prog_bar=True, batch_size=bs, on_epoch=True)
         self.log(f"pearson_fc", pearson_fc, prog_bar=True, batch_size=bs, on_epoch=True)
         self.log(f"pearson_x", pearson_x, prog_bar=True, batch_size=bs, on_epoch=True)
         return loss
-    
+
     def on_train_epoch_start(self):
+        """Update the KL weight for this epoch per `kl_schedule` and log it."""
         self.kl = self.kl_schedule(self.current_epoch)
         self.log("kl_factor", self.kl, prog_bar=True)
         self.log("lr", self.lr, prog_bar=True)
 
     def kl_schedule(self, time_step, ):
+        """Sigmoid KL-annealing weight, ramping up around epoch `kl_midpoint`."""
         return float(1 / (1. + np.exp(self.kl_slope * (self.kl_midpoint - float(time_step)))))
 
     def predict_fc(self, batch, batch_idx):
+        """Derive the predicted logFC signature from paired perturbed/control decodes.
+
+        Decodes the same latent with the batch's perturbation vector and
+        with an all-zero (control) vector, then takes
+        `log2(decoded_pert / decoded_ctrl)` as the predicted signature.
+        Returns `(predicted_fc, loss_vs_ground_truth_fc, pearson_fc, pearson_x)`.
+        """
         stage = "fc_prediction"
         x, gt_fc, pert = batch
         mu = self.mu_encoder(x)
@@ -397,6 +429,7 @@ class cVAE(Baseline, pl.LightningModule):
         return fc, loss, pearson_fc, pearson_x
 
     def log2foldchange(self, y, ctrl, eps=1e-6) -> torch.Tensor:
+        """Elementwise log2(y / ctrl), clamping both to `eps` to avoid log(0)/div-by-0."""
         y = torch.clamp(y, min=eps)
         ctrl = torch.clamp(ctrl, min=eps)
         return torch.log2(y/ctrl)

@@ -1,5 +1,4 @@
-## Perturbation Effect Prediction
-
+# Task 3 - Perturbation prediction
 ### Task
 
 Can a model predict transcriptome changes for a gene that was not knocked out in the training data?
@@ -8,7 +7,88 @@ Before model training, select a subset of 50 perturbations for modeling and expl
 
 The target variable to predict by your models is the mean log2 fold change (LFC) per condition and perturbation target. Train two (if one student), three (if two students), or four (if three students) types of models. Here, a type of model is a feature engineering strategy combined with a learning algorithm. At least one of the models should be deliberately simplistic. Evaluate the model performance and uncertainty based on suitable metrics and interpret the results biologically. You may also use the protein data, however, this is not required. Students working alone only need to use data from the co-culture condition.
 
-## Neural Network Approach
+## Classical Statistical Approaches
+(by Atanas)
+
+For this task, the main goal for the model is to predict changes in gene expression for genes not featured in the training data. The main target variable for this task is the mean log2 fold change per condition and perturbation target for a selected set of 50 perturbations. As such, this would be considered a regression problem. The dataset used for this task is the previously mentioned dataset with 200 HVGs.
+
+### Experimental design
+
+Due to the complexety of this task, as with the previous task, several consessions were made. Firstly, due to technical difficulties, kernel crashes and overall longer training times, the number of perturbations was reduced from 50 to 30, leaving 25 perturbation conditions for training and 5 for testing. In addition, the culture conditions were also limited to Control and Co-culture to further reduce the dataset. The perturbation conditions were chosen based on the number of cell per perturbation condition. The top 30 perturbations with the highest cell counts, excluding the control cells, were selected. The first 25 of them were used for training, while the final 5 were used for testing. 
+
+The target mean log2 fold changes were claculated per condition per perturbatino target using the scanpy function `sc.get.rank_genes_groups`. Each observation (cell) was assigned a target variable value based on their condition and perturbation grouping, with cells within the same group getting the same value. For each observation, the target variable was a 30-dimensional array, for each selected perturbation target.
+
+In order to compile the feature set, 2 approaches were implemented. All genes in the dataset were sorted by thei normalized dispersion column `dispersions_norm`, which results from the scanpy HVG selection and the top 2000 HVGs were selected.The authors of the publication _"...performed pooled Perturb-CITE-seq screens of ICR program genes in a patient-derived tumor-TIL co-culture model, targeting 248 genes of the ICR signature (744 targeting guides)..."_. As such, the `adata.obs` column `guide_id` to filter out all genes, that have been targeted and could carry information regarding the perturbation condition. In order to avoid leakage, all perturbed genes were removed from the feature set. 
+
+A gene expression matrix containing all cells with the chosen training perturbations for all genes in the selected feature set was split into a Training and Validation in a 75%/25% split. For this regression task, 2 regression models from `scikit-learn` were selected: a ridge linear regression model and a random forest regressor model. The experimental set up was based on `scikit-learn`'s API and was the same for both models. A grid search parameter optimiazation with stratified k-fold cross-validation (k=3) was used to optimize hyperparameters for the models using the training set, on which the best performing model was fitted.
+
+### Model evaluation
+
+For regression tasks, the models were evaluated based on the :
+
+* Mean Absolute Error: Average absolute difference between predictions and actuals.
+* Mean Squared Error: Squares errors to penalize large deviations more.
+* Root Mean Squared Error: Same units as target, penalizes large errors.
+* R^2 Score: Proportion of variance explained by the model.
+* Person score: The correlation between the true and predicted targets.
+
+Based on the evaluation metrics, the Random forest regresor showed a slighlty better performance across all metrics in this multi-target regression task. As the target variable is multi-dimensional, looking at the mean values does provide much useful information, however the individual performance metrics per target indicate, the predicted log2FC for some pertrubation genes are better than for other perturbation genes. However, there are several main issues with these evaluation metrics. The main problem can be seen looking into the boxplots showing the wide scale of the log2FC values for the different genes, which could make all error-based performance metrics difficult to interpret.
+
+```Python
+# Model evaluation - validation set
+
+# Ridge regression
+#R-squared:  -0.14179773381220684
+#Mean absolute error:  1.245088393456913
+#Mean squared error:  12.93050721254891
+#Root mean squared error: 1.6089768970212894
+#Pearson:  0.7961969578295705
+
+# Random forest regression
+#R-squared:  0.0890854956818329
+#Mean absolute error:  1.1075968113183619
+#Mean squared error:  10.272217751606357
+#Root mean squared error: 1.4362768737280658
+#Pearson:  0.8324481961867805
+```
+
+While the performance metrics on the testing perturbations seem comparable to those on the validation set, there are several crucial factors to consider. Firstly, the training perturbations are still present in the target vector and may skew the model performance metrics, since they would contribute more towards the individual metrics. As mentioned, it would be useful to look at the performance metrics for the individual perturbation genes. 
+
+```python
+# Model evaluation - testing set
+
+# Ridge regression
+#R-squared:  -2.537997574055322
+#Mean absolute error:  1.2168186090567799
+#Mean squared error:  12.000184783181112
+#Root mean squared error: 1.59421253310336
+#Pearson:  0.8246698610910892
+
+# Random forest regression
+#R-squared:  -0.471253932722074
+#Mean absolute error:  1.0875212658101172
+#Mean squared error:  9.226183980509036
+#Root mean squared error: 1.3534550274305877
+#Pearson:  0.8587254365765324
+```
+Overall, looking at the plotted residuals between the true and predicted values, as well as the scatterplots of true vs. predicted log2FC values, both models perform quite badly. In this case with low training and test performance both models would be considered biased and underfitted.
+
+### Outlook
+
+As with Task 1, the dataset was reduced in favour of faster training times. While performing badly, both the Ridge regression and the Random forst showed some capacity to model the data and there are several alternative approaches that may show better results. An alternate feature engineering strategy, such as adding the top principle components could help the models distinguish between individual perturbation groupings. Another approach would require the use of more complex models, which would be better suited to fit the relation ship between a perturbed gene and a single-cell gene expression profile. 
+
+## References
+
+1. Heumos, L., Schaar, A.C., Lance, C. et al. Best practices for single-cell analysis across modalities. Nat Rev Genet (2023). https://doi.org/10.1038/s41576-023-00586-w
+2. Marchetti, F., Legnaro, E., & Guastavino, S. (2025). Multiclass threshold-based classification. arXiv preprint arXiv:2505.11276.
+3. https://stats.stackexchange.com/questions/611695/how-to-adjust-the-classification-thresholds-in-a-multiclass-classification-probl
+4. https://www.genecards.org/
+5. Laffin B and Petrash JM (2012) Expression of the Aldo-Ketoreductases AKR1B1 and AKR1B10 in Human Cancers. Front. Pharmacol. 3:104. doi: 10.3389/fphar.2012.00104
+6. Waters JA, Urbano I, Robinson M and House CD (2022) Insulin-like growth factor binding protein 5: Diverse roles in cancer. Front. Oncol. 12:1052457. doi: 10.3389/fonc.2022.1052457
+
+
+## Neural Network Approaches
+(by Nicolas)
 
 ### Methods
 
