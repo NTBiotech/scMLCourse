@@ -159,6 +159,8 @@ def train(
     log_dir: str = "logs",
     run_name: str = "pert_regressor",
     seed: int = 0,
+    test_on:str="best",
+    **kwargs
 ):
     """Train `model` on `data_module` with early stopping and checkpointing.
 
@@ -202,10 +204,11 @@ def train(
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         deterministic=True,
+        **kwargs
     )
  
     trainer.fit(model, datamodule=data_module)
-    test_scores = trainer.test(model, datamodule=data_module, ckpt_path="best")
+    test_scores = trainer.test(model, datamodule=data_module, ckpt_path=test_on)
 
     return model, test_scores, loggers[0].log_dir
 
@@ -213,7 +216,7 @@ def train(
 class Baseline(pl.LightningModule):
     """MLP regressor predicting a cell's perturbation log-fold-change signature from its expression."""
 
-    def __init__(self, mlp_kwargs:dict, loss=nn.MSELoss, lr=1e-5):
+    def __init__(self, mlp_kwargs:dict, loss=nn.MSELoss, lr=0.001):
         super().__init__()
         self.module = MLP(**mlp_kwargs, )
         self.loss = loss()
@@ -262,6 +265,36 @@ class Baseline(pl.LightningModule):
             "optimizer": opt,
             "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"},
         }
+
+
+class condMLP(Baseline):
+    '''MLP regressor predicting log-fold-change from perturbation condition.'''
+    def _step(self, batch, batch_idx, stage:str):
+            """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
+            x, log_fold_change, pert = batch
+            y = self.module(pert.to(torch.float32))
+            loss = self.loss(log_fold_change, y)
+            bs = x.size(0)
+            self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs,
+                    on_step=(stage == "train"), on_epoch=True)
+            self.log(f"{stage}_pearson", self._pearson(y, log_fold_change), prog_bar=(stage != "train"),
+                    batch_size=bs, on_step=False, on_epoch=True)
+            return loss
+
+class pertMLP(Baseline):
+    '''MLP regressor predicting log-fold-change from perturbation condition and expression data'''
+    def _step(self, batch, batch_idx, stage:str):
+            """Compute loss and log loss/Pearson metrics for a train/val/test batch."""
+            x, log_fold_change, pert = batch
+            y = self.module(torch.concat((x, pert.to(torch.float32)), dim=1))
+            loss = self.loss(log_fold_change, y)
+            bs = x.size(0)
+            self.log(f"{stage}_loss", loss, prog_bar=True, batch_size=bs,
+                    on_step=(stage == "train"), on_epoch=True)
+            self.log(f"{stage}_pearson", self._pearson(y, log_fold_change), prog_bar=(stage != "train"),
+                    batch_size=bs, on_step=False, on_epoch=True)
+            return loss
+
 
 class cVAE(Baseline, pl.LightningModule):
     '''Conditional Autoencoder'''
