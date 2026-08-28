@@ -7,7 +7,7 @@ Before model training, select a subset of 50 perturbations for modeling and expl
 choice. Of these, select a subset of perturbations that are held out, i.e., not used during training or hyperparameter selection, only at test time. If the number of selected genes is still too high for the model you want to train, you may subset it further and explain your choice.
 You may also use unperturbed cells.
 
-The target variable to predict by your models is the mean log2 fold change per condition and perturbation target. Train two (if one student), three (if two students) or four (if three students) types of models. Here, a type of model is a feature engineering strategy combined with a learning algorithm. At least one of the models should be deliberately simplistic. Evaluate the model performance and uncertainty based on suitable metrics and interpret the results biologically.
+The target variable to predict by your models is the mean log2 fold change (LFC) per condition and perturbation target. Train two (if one student), three (if two students) or four (if three students) types of models. Here, a type of model is a feature engineering strategy combined with a learning algorithm. At least one of the models should be deliberately simplistic. Evaluate the model performance and uncertainty based on suitable metrics and interpret the results biologically.
 You may also use the protein data, however, this is not required. Students working alone only need to use data from the co-culture condition.
 ## Neural Network Approach:
 ### Methods
@@ -24,6 +24,32 @@ As a comparative baseline we train three MLPs on the same task of perturbation. 
 3. Both expression data and perturbation condition
 
 #### Data Preparation
-We preprocess data as done in task 1 and 2. Additionally, we normalize, log-transform and select the top 1000 most highly variable genes. As a subset of perturbation conditions, we choose the 50 most common perturbations called in the dataset. To allow for effective generalization, we use the union of highly variable genes and top perturbations as the input for the encoder. Samples with no perturbation are included in the processed dataset.
+We preprocess data as done in task 1 and 2. Additionally, we normalize, log-transform and select the top 2000 most highly variable genes. As a subset of perturbation conditions, we choose the 50 most common perturbations called in the dataset. To allow for effective generalization, we use the union of highly variable genes and top perturbations as the input for the encoder. Samples with no perturbation are included in the processed dataset.
+We split the data into training and test datasets, with 40 perturbations + control in the training dataset and 10 perturbations in the test dataset. Then we further split the training set into training and validation set, while stratifying the perturbation conditions.
 
-### Results
+### Discussion
+We trained and tested three baseline MLP models in the task of perturbation effect prediction.
+Here, we observe rapid overfitting in the model trained only on expression profiles. Adding perturbation condition to the input, seemed to prevent overfitting, but resulted in a decrease in correlation when predicting the test set.
+
+Our cVAE model required careful calibration of the Kullback-Leibler (KL) weighting warmup to prevent the collapse of the latent distribution.
+The model performed adequately in reconstructing expression values in both test and validation set, but lacked the ability to predict the LFC in the test set.
+This can be partly explained by the primitive mechanism of LFC prediction, that involves conditioning the decoder on control and perturbation and calculating the cell-specific LFC. Success in this task would suggest the model parameterizes the underlying GRN, which is extremely challenging, even for state-of-the-art models. Further analysis of the models predictions might uncover avenues for improvement, but we are limit in this task by time and resources. Moreover, recent efforts in benchmarking perturbation modelling techniques bring the use of deep neural networks into question. One example is  (Ahlmann-Eltze et al., 2025), who compared sophisticated deep learning to deliberately simple linear approaches.
+
+An in-depth work on this problem would involve testing models through cross-validation, comparing to linear baselines and testing published models, such as scVI and PCA (suggested by (Bendidi et al., 2024)).
+
+- Baseline model performance
+    - expression data only shows rapid overfitting
+    - conditioning has limited learning capacity
+    - best performance from expression and condition input
+    - generalization on test set (unseen perturbations) is limited
+    - on unseen perturbations, all perform badly
+- cVAE
+    - balancing of loss terms and kl warmup requires carefull calibration to prevent latent collapse
+    - pearson correlation of predicted expression is relatively high even on unseen perturbations
+    - prediction of fold change using contrastive conditioning has low correlation with the ground truth data
+    - this model is not directly trained on the fold-change, i.e. has no risk of data-leakage
+- General concerns
+    - limited effort, larger specialized models might lead to better predictions
+    - predicting log-fold-change from expression/condition might be data leakage
+        -> the model learns the mean expressions rather than a representation of the underlying GRN
+    - cross validation would be good, but couldn't be performed due to the required compute time
